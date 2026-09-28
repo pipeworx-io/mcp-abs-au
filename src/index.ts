@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -670,6 +757,179 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+
+/**
+ * What an SDMX REST server means by a 404 (fleet #2494).
+ *
+ * SDMX servers answer "nothing here" with a 404 and a one-line body, and the
+ * same status covers two opposite situations:
+ *   - the dataflow EXISTS and the key/period matched no observations — an
+ *     honest empty, which must come back as an empty result with a reason
+ *     (docs/silent-zero-policy.md), not as a failure; and
+ *   - the dataflow id does NOT exist — the caller's argument is wrong, and the
+ *     answer is a `not_found` pointing at the pack's list tool.
+ * A 422 is a third caller mistake: the key has the wrong number of positions.
+ *
+ * Every SDMX pack used to throw all of these as a bare `<SOURCE>: 404 <body>`,
+ * which the gateway books as class `error` (a Pipeworx defect, 500) and answers
+ * with "Retry the same tool…". abs-au's one external caller retried 55 times in
+ * an hour; istat-it, statec-lu and ilostat had the identical mapping.
+ *
+ * The body patterns are VERBATIM from the live servers, 2026-09-28. The wording
+ * is per server implementation, not per agency, which is why it lives here once:
+ *   .Stat Suite / NSI (ABS, ISTAT, STATEC, ILO):
+ *     404 "NoRecordsFound"
+ *     404 "Could not find Dataflow and/or DSD related with this data request"
+ *     404 "Could not find requested structures"
+ *     422 "Not enough key values in query, expecting 5 got 2"
+ *   ILO (its own no-data wording on the same NSI stack):
+ *     404 "No data is found. Please adjust your query parameters and try again."
+ *   Fusion Metadata Registry (UNICEF):
+ *     404 {"errors":[{"code":404,"message":"No data for data query against the dataflow: urn:…"}]}
+ *     404 {"errors":[{"code":404,"message":"No Dataflow exists for query : Target: Dataflow - … Maintainable Id: X …"}]}
+ *
+ * An unrecognised 404 body returns undefined on purpose: the pack keeps its old
+ * error path, so a dead endpoint that also answers 404 stays visible as a
+ * failure instead of being relabelled as a quiet empty.
+ *
+ * Self-contained (no imports) so publish-pack's helper inliner can copy it into
+ * a standalone pack bundle.
+ */
+
+type SdmxMiss = 'no_records' | 'no_dataflow' | 'bad_key';
+
+const NO_RECORDS = /NoRecordsFound|NoResultsFound|No data is found|No data for data query|No Results Found/i;
+const NO_DATAFLOW = /Could not find Dataflow|Could not find requested structures?|No Dataflow exists|No Structures? (?:found|exists)/i;
+const BAD_KEY = /key values in query|expecting \d+ got \d+|Invalid (?:data )?key|not a valid key/i;
+
+/** Which caller-side miss an SDMX error response is, or undefined when it is none of them. */
+function classifySdmxMiss(status: number, body: string): SdmxMiss | undefined {
+  if (status === 404) {
+    // Order matters only for a body that somehow names both; "no records"
+    // presupposes the dataflow resolved, so it is the more specific claim.
+    if (NO_RECORDS.test(body)) return 'no_records';
+    if (NO_DATAFLOW.test(body)) return 'no_dataflow';
+    return undefined;
+  }
+  if (status === 422) return 'bad_key';
+  if (status === 400 && BAD_KEY.test(body)) return 'bad_key';
+  return undefined;
+}
+
+/** A non-OK SDMX response, keeping status and body so a caller can classify it. */
+class SdmxHttpError extends Error {
+  readonly status: number;
+  readonly body: string;
+  constructor(status: number, body: string, message: string) {
+    super(message);
+    this.name = 'SdmxHttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/**
+ * The error a pack's SDMX fetch should throw for a non-OK response: carries
+ * status and body, and leads with `upstream_down:` for a 5xx or 429 so a real
+ * outage keeps its class.
+ */
+function sdmxHttpError(source: string, status: number, body: string): SdmxHttpError {
+  const prefix = status >= 500 || status === 429 ? 'upstream_down: ' : '';
+  return new SdmxHttpError(status, body, `${prefix}${source}: ${status} ${body}`);
+}
+
+interface SdmxMissContext {
+  /** Human name of the source, e.g. "ISTAT". */
+  source: string;
+  dataflowId: string;
+  key?: string;
+  startPeriod?: string;
+  endPeriod?: string;
+  /** The pack's argument NAME for the dataflow id (default "dataflow_id"). */
+  idArg?: string;
+  /** The pack's list and structure tool names (defaults: list_dataflows, dataflow_structure). */
+  listTool?: string;
+  structureTool?: string;
+  /**
+   * Which endpoint answered. On a STRUCTURE query (/dataflow/…, /datastructure/…)
+   * there are no observations to be missing, so a "no results" body can only
+   * mean the structure does not exist — UNICEF answers an unknown dataflow's
+   * structure with `{"errors":[{"code":404,"message":"No Results Found"}]}`.
+   * Default 'data'.
+   */
+  endpoint?: 'data' | 'structure';
+}
+
+/**
+ * The DSD id a dataflow points at, read from a `/dataflow/{agency}/{id}` stub
+ * response (SDMX-JSON 1.0 `data.dataflows[0].structure`, a URN like
+ * "urn:sdmx:…DataStructure=IT1:DCSP_COLTIVAZIONI(1.1)").
+ *
+ * Exists because a dataflow id is NOT its DSD id for every flow: ISTAT's
+ * 101_1015 is DSD DCSP_COLTIVAZIONI, and 9 of ABS's 1,227 flows differ
+ * (LF_UNDER → DS_LF_UNDER). A pack that asks /datastructure/{dataflowId} gets
+ * "Could not find requested structures" for those, which must not be reported
+ * as "no such dataflow".
+ */
+function dsdIdFromDataflow(json: unknown): string | undefined {
+  const data = (json as { data?: { dataflows?: { structure?: unknown }[] } } | null)?.data;
+  const urn = data?.dataflows?.[0]?.structure;
+  if (typeof urn !== 'string') return undefined;
+  const m = urn.match(/[=:]([A-Za-z0-9_@$\-]+)\([^)]*\)\s*$/);
+  return m?.[1];
+}
+
+/**
+ * What a pack should RETURN for a caught SDMX error, or undefined when the
+ * error is not a recognised caller-side miss (the pack rethrows it).
+ *
+ *   no_records  → `{dataflow_id, key, series_count: 0, series: [], empty_reason: 'no_match', note}`
+ *   no_dataflow → `{error: 'not_found', message}` naming the list tool
+ *   bad_key     → `{error: 'user_error', message}` naming the structure tool
+ *
+ * Returned rather than thrown so the gateway books the envelope's own class
+ * (user_error / not_found) with a 200, not a blanket thrown-exception 500.
+ */
+function sdmxMissResult(err: unknown, ctx: SdmxMissContext): Record<string, unknown> | undefined {
+  if (!(err instanceof SdmxHttpError)) return undefined;
+  let miss = classifySdmxMiss(err.status, err.body);
+  if (!miss) return undefined;
+  if (ctx.endpoint === 'structure' && miss === 'no_records') miss = 'no_dataflow';
+  const idArg = ctx.idArg ?? 'dataflow_id';
+  const listTool = ctx.listTool ?? 'list_dataflows';
+  const structureTool = ctx.structureTool ?? 'dataflow_structure';
+  const structureCall = `${structureTool}({${idArg}: "${ctx.dataflowId}"})`;
+  if (miss === 'no_records') {
+    const period = ctx.startPeriod || ctx.endPeriod ? ` in period ${ctx.startPeriod ?? '…'} to ${ctx.endPeriod ?? '…'}` : '';
+    return {
+      dataflow_id: ctx.dataflowId,
+      key: ctx.key ?? 'all',
+      ...(ctx.startPeriod ? { start_period: ctx.startPeriod } : {}),
+      ...(ctx.endPeriod ? { end_period: ctx.endPeriod } : {}),
+      series_count: 0,
+      series: [],
+      empty_reason: 'no_match',
+      note:
+        `${ctx.source} has dataflow "${ctx.dataflowId}" but no observations match key "${ctx.key ?? 'all'}"${period}. ` +
+        `Check each dot-separated position against the valid codes from ${structureCall}, or widen the period.`,
+    };
+  }
+  if (miss === 'no_dataflow') {
+    return {
+      error: 'not_found',
+      message: `${ctx.source} has no dataflow "${ctx.dataflowId}". Call ${listTool} to find the id, then ${structureTool} to build the key.`,
+      [idArg]: ctx.dataflowId,
+    };
+  }
+  const detail = err.body.replace(/\s+/g, ' ').trim().slice(0, 200);
+  return {
+    error: 'user_error',
+    message:
+      `${ctx.source} rejected key "${ctx.key ?? ''}" for dataflow "${ctx.dataflowId}"${detail ? `: ${detail}` : ''}. ` +
+      `The key needs one dot-separated position per dimension, in the order ${structureCall} lists them.`,
+  };
+}
 /**
  * Australian Bureau of Statistics (ABS) Data API MCP.
  *
@@ -794,7 +1054,28 @@ async function listDataflows(search: string | undefined, limit: number): Promise
 }
 
 async function dataflowStructure(dataflowId: string, maxCodes: number): Promise<unknown> {
-  const json = (await absGet(`/datastructure/ABS/${encodeURIComponent(dataflowId)}?references=all`, ACCEPT_STRUCTURE)) as any;
+  let json: any;
+  try {
+    json = await absGet(`/datastructure/ABS/${encodeURIComponent(dataflowId)}?references=all`, ACCEPT_STRUCTURE);
+  } catch (err) {
+    if (!(err instanceof SdmxHttpError) || !classifySdmxMiss(err.status, err.body)) throw err;
+    // "Could not find requested structures" here is NOT proof the dataflow is
+    // missing: this asks for the DSD by the DATAFLOW's id, and 9 of ABS's
+    // 1,227 flows use a different DSD id (LF_UNDER → DS_LF_UNDER), so those
+    // were unreachable through this tool. Ask the dataflow itself — a 404
+    // there is the real unknown id (fleet #2494) — and follow its structure
+    // reference otherwise.
+    let flow: unknown;
+    try {
+      flow = await absGet(`/dataflow/ABS/${encodeURIComponent(dataflowId)}`, ACCEPT_STRUCTURE);
+    } catch (flowErr) {
+      if (flowErr instanceof SdmxHttpError && classifySdmxMiss(flowErr.status, flowErr.body)) return dataflowNotFound(dataflowId);
+      throw flowErr;
+    }
+    const dsdId = dsdIdFromDataflow(flow);
+    if (!dsdId || dsdId === dataflowId) throw err;
+    json = await absGet(`/datastructure/ABS/${encodeURIComponent(dsdId)}?references=all`, ACCEPT_STRUCTURE);
+  }
   const data = json?.data ?? {};
   const dsd = (data.dataStructures ?? [])[0];
   if (!dsd) throw new Error(`ABS: no data structure found for dataflow "${dataflowId}"`);
@@ -822,7 +1103,8 @@ async function dataflowStructure(dataflowId: string, maxCodes: number): Promise<
   dims.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
   return {
-    dataflowId: dsd.id,
+    dataflowId,
+    dsdId: dsd.id,
     name: dsd.name ?? dsd.names?.en,
     description: dsd.description,
     dataKeyHint: `Build a dataKey as ${dims.map((d) => `<${d.id}>`).join('.')} (dot-separated, this order). Use "" for a wildcard position, "+"-join multiple codes, or pass "all" for the whole key.`,
@@ -854,7 +1136,55 @@ async function getData(
   if (endPeriod) params.set('endPeriod', endPeriod);
   const qs = params.toString();
   const path = `/data/${encodeURIComponent(dataflowId)}/${encodeURIComponent(dataKey)}${qs ? `?${qs}` : ''}`;
-  const json = (await absGet(path, ACCEPT_DATA)) as any;
+  let json: any;
+  try {
+    json = await absGet(path, ACCEPT_DATA);
+  } catch (err) {
+    if (!(err instanceof SdmxHttpError)) throw err;
+    const miss = classifySdmxMiss(err.status, err.body);
+    // ABS answers every "nothing here" with a 404 and a one-line text/plain
+    // body, and before fleet #2494 all of them threw as a bare `ABS: 404 …`.
+    // That booked as class `error` (a Pipeworx defect, 500 in blob5), and the
+    // gateway told the caller to retry the same tool — one external script did
+    // exactly that 55 times in an hour. Two different things hide behind the
+    // same 404, and they need opposite answers:
+    //   NoRecordsFound  — the dataflow exists, the key/period matched nothing.
+    //                     An honest empty, labelled so it is never a bare [].
+    //   no Dataflow/DSD — the dataflow id itself does not exist. The caller's
+    //                     argument is wrong; say which tool finds a right one.
+    // A 422 ("Not enough key values in query, expecting 5 got 2") is the key
+    // having the wrong number of positions — also the caller's argument.
+    // Anything else (5xx, 429, timeouts) keeps its upstream classification.
+    if (miss === 'no_records') {
+      return {
+        dataflowId,
+        dataKey,
+        ...(startPeriod ? { startPeriod } : {}),
+        ...(endPeriod ? { endPeriod } : {}),
+        totalSeries: 0,
+        returnedSeries: 0,
+        series: [],
+        empty_reason: 'no_match',
+        note:
+          `ABS has dataflow "${dataflowId}" but no observations match dataKey "${dataKey}"` +
+          `${startPeriod || endPeriod ? ` in period ${startPeriod ?? '…'} to ${endPeriod ?? '…'}` : ''}. ` +
+          `Check each dot-separated position against the valid codes from dataflow_structure({dataflowId: "${dataflowId}"}), ` +
+          `or widen the period.`,
+      };
+    }
+    if (miss === 'no_dataflow') {
+      return dataflowNotFound(dataflowId);
+    }
+    if (miss === 'bad_key') {
+      return {
+        error: 'user_error',
+        message:
+          `ABS rejected dataKey "${dataKey}" for dataflow "${dataflowId}": ${dropClassPrefix(err.body.trim())}. ` +
+          `The key needs one dot-separated position per dimension, in the order dataflow_structure({dataflowId: "${dataflowId}"}) lists them.`,
+      };
+    }
+    throw err;
+  }
 
   // SDMX-JSON 1.0 says `structure`, 2.0.0 says `structures[0]`. Reading only
   // the 2.0.0 spelling meant a perfectly good 200 decoded to "No data returned
@@ -909,8 +1239,7 @@ async function absGet(path: string, accept: string): Promise<unknown> {
     // lists the media types it will accept, so pass that through verbatim
     // rather than making the next reader re-discover it.
     if (res.status === 406) throw new Error(`ABS rejected our Accept header. It will serve: ${body}`);
-    const prefix = res.status >= 500 || res.status === 429 ? 'upstream_down: ' : '';
-    throw new Error(`${prefix}ABS: ${res.status} ${body}`);
+    throw sdmxHttpError('ABS', res.status, body);
   }
   const ct = res.headers.get('content-type') ?? '';
   if (ct.includes('json')) return res.json();
@@ -921,6 +1250,51 @@ async function absGet(path: string, accept: string): Promise<unknown> {
   } catch {
     return { contentType: ct, body: text.slice(0, 4000) };
   }
+}
+
+/**
+ * The refusal for a dataflow id ABS does not have. RETURNED as a `not_found`
+ * envelope rather than thrown, so the gateway books it as the caller's
+ * mistake (user_error / not_found) instead of a 500, and points at the tool
+ * that finds a real id. Best-effort suggests near ids — "CPI_MONTHLY" is
+ * really "CPI_M" — but never lets that lookup turn the refusal into an outage.
+ */
+async function dataflowNotFound(dataflowId: string): Promise<unknown> {
+  let suggestions: { id: string; name?: string }[] = [];
+  try {
+    const json = (await absGet(`/dataflow?detail=allstubs`, ACCEPT_STRUCTURE)) as any;
+    suggestions = suggestDataflows(dataflowId, json?.data?.dataflows ?? []);
+  } catch {
+    // The refusal is still correct without suggestions.
+  }
+  const near = suggestions.length ? ` Closest ids: ${suggestions.map((f) => f.id).join(', ')}.` : '';
+  return {
+    error: 'not_found',
+    message:
+      `ABS has no dataflow "${dataflowId}".${near} Call list_dataflows({search: "..."}) to find the id, ` +
+      `then dataflow_structure to build the dataKey.`,
+    dataflowId,
+    suggestions,
+  };
+}
+
+/** Rank dataflows by how many tokens of the requested id appear in their id or name. */
+function suggestDataflows(requested: string, flows: any[], max = 5): { id: string; name?: string }[] {
+  const tokens = requested.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2);
+  if (!tokens.length) return [];
+  const scored: { id: string; name?: string; score: number }[] = [];
+  for (const f of flows) {
+    const id = String(f?.id ?? '');
+    const name = String(f?.name ?? f?.names?.en ?? '');
+    const hay = `${id} ${name}`.toLowerCase();
+    let score = 0;
+    for (const t of tokens) if (hay.includes(t)) score += 1;
+    if (!score) continue;
+    if (id.toLowerCase().startsWith(tokens[0])) score += 0.5;
+    scored.push({ id, name: name || undefined, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.id.length - b.id.length);
+  return scored.slice(0, max).map(({ id, name }) => ({ id, name }));
 }
 
 function urnToKey(urn: string): string {
