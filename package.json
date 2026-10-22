@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-abs-au",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Australian Bureau of Statistics (ABS) Data API MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-f0f05ccab457e46290c291330c8fdaee477500979b30667e898683a3b96f3f38",
-    "sourceCommit": "351c40908821cfecc9bb2f5849d87bbfdbb26d75"
+    "sourceHash": "v1-3f5c0c9848c333775f90d6a08fbc493476c6bb77789e9306e21752e6b14891aa",
+    "sourceCommit": "71f5325b13bb0ea0de2f0f7207885962ec91a484"
   }
 }
